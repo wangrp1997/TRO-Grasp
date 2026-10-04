@@ -7,6 +7,7 @@ import yourdfpy
 import numpy as np
 import time
 import tqdm
+import pytorch_kinematics as pk_kin
 import pyroki as pk
 from pyroki.costs._pose_cost_analytic_jac import _get_actuated_joints_applied_to_target
 
@@ -105,6 +106,17 @@ class PyrokiRetarget:
         self.target_link_index = jnp.array([
             self.robot.links.names.index(name) for name in target_link_name
         ])
+        # pytorch-kinematics includes mimic joints in q; pyroki IK uses actuated-only q.
+        pk_chain = pk_kin.build_chain_from_urdf(open(urdf_path).read())
+        self.pk_joint_names = list(pk_chain.get_joint_parameter_names())
+        act_names = list(self.robot.joints.actuated_names)
+        full_names = list(self.robot.joints.names)
+        self._pk_to_act = jnp.asarray(
+            [self.pk_joint_names.index(n) for n in act_names], dtype=jnp.int32
+        )
+        self._full_to_pk = jnp.asarray(
+            [full_names.index(n) for n in self.pk_joint_names], dtype=jnp.int32
+        )
         
     def solve_retarget(
         self,
@@ -173,8 +185,15 @@ class PyrokiRetarget:
             )
 
             return sol[joint_var]
-        
-        return jax.vmap(solve_single)(initial_q, target_pos)
+
+        n_act = self.robot.joints.num_actuated_joints
+        if initial_q.shape[-1] != n_act:
+            initial_q = initial_q[..., self._pk_to_act]
+        q_act = jax.vmap(solve_single)(initial_q, target_pos)
+        if q_act.shape[-1] == len(self.pk_joint_names):
+            return q_act
+        q_full = self.robot.joints.get_full_config(q_act)
+        return q_full[..., self._full_to_pk]
 
 def main():
 

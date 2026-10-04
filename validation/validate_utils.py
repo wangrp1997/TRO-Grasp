@@ -79,10 +79,18 @@ def validate_isaac(robot_name, object_name, q_batch, gpu: int = 0):
     batch_size = q_batch.shape[0]
 
     env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = f"/home/fx/.conda/envs/isaac/lib:" + env.get("LD_LIBRARY_PATH", "")
-    env["CUDA_VISIBLE_DEVICES"] = "3"
+    isaac_conda = os.environ.get("TRO_ISAAC_CONDA", "isaac")
+    isaac_lib = os.environ.get(
+        "TRO_ISAAC_CONDA_LIB",
+        os.path.expanduser(f"~/miniconda3/envs/{isaac_conda}/lib"),
+    )
+    if os.path.isdir(isaac_lib):
+        env["LD_LIBRARY_PATH"] = f"{isaac_lib}:" + env.get("LD_LIBRARY_PATH", "")
+    env.setdefault("VK_ICD_FILENAMES", "/etc/vulkan/icd.d/nvidia_icd.json")
+    cuda_visible = os.environ.get("TRO_CUDA_VISIBLE_DEVICES", str(gpu))
+    env["CUDA_VISIBLE_DEVICES"] = cuda_visible
     args = [
-        "conda", "run", "-n", "isaac",
+        "conda", "run", "-n", isaac_conda,
         "python", os.path.join(ROOT_DIR, 'validation/isaac_main.py'),
         "--mode", "validation",
         "--robot_name", robot_name,
@@ -91,6 +99,10 @@ def validate_isaac(robot_name, object_name, q_batch, gpu: int = 0):
         "--q_file", q_file_path,
         "--gpu", str(gpu),
     ]
+    if os.environ.get("TRO_SKIP_ISAAC", "0") == "1":
+        cprint("TRO_SKIP_ISAAC=1: skip Isaac Gym, success flags all False", "yellow")
+        return torch.zeros(batch_size, dtype=torch.bool), q_batch
+
     ret = subprocess.run(args, capture_output=True, text=True, env=env)
     try:
         ret_file_path = os.path.join(ROOT_DIR, f'tmp/isaac_main_ret_{gpu}.pt')

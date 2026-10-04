@@ -128,7 +128,10 @@ def test(config):
         success_dict[batch["object_name"]] = success
 
         # Diversity
-        success_q = all_predict_q[success]
+        if torch.as_tensor(success).any():
+            success_q = all_predict_q[success]
+        else:
+            success_q = all_predict_q
         diversity_dict[batch["object_name"]] = success_q
 
         for diffuse_step, transform_list in transform_dict.items():
@@ -157,7 +160,11 @@ def test(config):
     )
 
     output_path = os.path.join(config.test.save_dir, "res.txt")
+    skip_isaac = os.environ.get("TRO_SKIP_ISAAC", "0") == "1"
     with open(output_path, "w") as f:
+        if skip_isaac:
+            f.write("ISAAC_SKIPPED=1  success rate is not comparable to the paper.\n")
+            print("ISAAC_SKIPPED=1  success rate is not comparable to the paper.")
         total_success = 0
         total_sum = 0
         for obj, obj_res in success_dict.items():
@@ -171,13 +178,20 @@ def test(config):
         print(line, end="")
         f.write(line)
 
-        all_success_q = torch.cat(list(diversity_dict.values()), dim=0)
-        diversity_std = torch.std(all_success_q, dim=0).mean()
+        nonempty = [v for v in diversity_dict.values() if len(v) > 0]
+        if nonempty:
+            all_success_q = torch.cat(nonempty, dim=0)
+            diversity_std = torch.std(all_success_q, dim=0).mean()
+        else:
+            diversity_std = torch.tensor(float("nan"))
         line = f"Total diversity: {diversity_std}\n"
         print(line, end="")
         f.write(line)
 
-        line = f"Grasp generation time: {total_inference_time / total_grasp_num} s.\n"
+        if total_grasp_num:
+            line = f"Grasp generation time: {total_inference_time / total_grasp_num} s.\n"
+        else:
+            line = "Grasp generation time: n/a (no timed grasps; first split is warmup).\n"
         print(line, end="")
         f.write(line)
 
