@@ -1,12 +1,12 @@
 dataset:
   robot_names:
-    - 'allegro'
+    - 'barrett'
 
   debug_object_names: null
 
   batch_size: 100  # sample per object
   num_workers: 8
-  object_pc_type: 'random'  # 'fixed', 'random', 'partial'
+  object_pc_type: 'partial'  # 'fixed', 'random', 'partial'
 
 model:
   vqvae_cfg:
@@ -63,8 +63,8 @@ model:
     rot_weight: 1.0
 
 test:
-  embodiment: "allegro"
+  embodiment: "barrett"
   ckpt: "ckpt/multi_hand.pth"
-  save_dir: "/mnt/hdd/tro_grasp/logs/paper_unconditioned_allegro_metrics"
+  save_dir: "/mnt/hdd/tro_grasp/logs/paper_unconditioned_barrett_partial"
   gpu: 0
   split_batch_size: 20

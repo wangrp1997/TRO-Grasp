@@ -114,13 +114,31 @@ class GraphLayer(nn.Module):
             nn.Linear(e_rr_dim, e_rr_dim)
         )
 
+    def _or_softmax(self, or_attn, patch_type):
+        # or_attn: [B, L, P, n_grp, 1]; softmax over patches (dim=2).
+        if patch_type is None:
+            return torch.softmax(or_attn, 2)
+        attn = torch.zeros_like(or_attn)
+        for typ in (0, 1):
+            keep = patch_type == typ
+            if not bool(keep.any()):
+                continue
+            mask = keep[:, None, :, None, None]
+            masked = or_attn.masked_fill(~mask, float("-inf"))
+            valid = keep.any(dim=-1)
+            part = torch.softmax(masked, 2)
+            part = torch.where(valid[:, None, None, None, None], part, torch.zeros_like(part))
+            attn = attn + torch.nan_to_num(part, nan=0.0)
+        return attn
+
     def forward(
         self,
         object_node_f,
         robot_node_f,
         or_edge_f,
         rr_edge_f,
-        t_embed  # [B, 200]
+        t_embed,  # [B, 200]
+        patch_type=None,
     ):
         B, L, P, F = or_edge_f.shape
         
@@ -145,8 +163,8 @@ class GraphLayer(nn.Module):
         or_attn = or_query * or_key  # [B, L, P, E_or]
         or_attn = or_attn.reshape(B, L, P, -1, self.c_atten_head)
         or_attn = or_attn.sum(-1, keepdim=True) / np.sqrt(self.c_atten_head * 3.0)
-        
-        or_attn = torch.softmax(or_attn, 2)
+
+        or_attn = self._or_softmax(or_attn, patch_type)
         or_attn = or_attn.expand(-1, -1, -1, -1, self.c_atten_head).reshape(B, L, P, -1)  # [B, L, P, E_or]
 
         or_edge_o = object_node_f[:, None, :, :].expand(-1, L, -1, -1)  # [B, L, P, N_o]
@@ -369,7 +387,8 @@ class GraphDenoiser(torch.nn.Module):
                 robot_node_f,
                 or_edge_f,
                 rr_edge_f,
-                t_embed
+                t_embed,
+                patch_type=None,
             )
             noisy_robot_node_f_list.append(robot_node_f)
             noisy_or_edge_f_list.append(or_edge_f)
@@ -391,4 +410,82 @@ class GraphDenoiser(torch.nn.Module):
             cur += f_dim
         v_robot_pred = torch.cat(v_robot_pred, dim=-1)
         return v_robot_pred
-        
+
+
+class ResidualGraphDenoiser(GraphDenoiser):
+    """Smaller OR/RR stack; z_s on link tokens; tgt/clt split softmax."""
+
+    def __init__(self, z_s_dim: int = 64, zero_init_out: bool = True, **kwargs):
+        super().__init__(**kwargs)
+        self.z_s_dim = z_s_dim
+        self.z_s_proj = nn.Linear(z_s_dim, self.v_conv_dim)
+        nn.init.zeros_(self.z_s_proj.weight)
+        nn.init.zeros_(self.z_s_proj.bias)
+        if zero_init_out:
+            for mlp in self.v_robot_output_module:
+                nn.init.zeros_(mlp.out_fc0.weight)
+                nn.init.zeros_(mlp.out_fc0.bias)
+
+    def forward(
+        self,
+        V_O,
+        noisy_V_R,
+        noisy_E_OR,
+        noisy_E_RR,
+        t,
+        z_s=None,
+        patch_type=None,
+    ):
+        B = t.shape[0]
+        t_embed = self.t_embed[t]
+
+        object_node_f = self._encoder_(
+            V_O, self.V_object_dims, self.V_object_in_layers
+        )
+        robot_node_f = self._encoder_(
+            noisy_V_R, self.V_robot_dims, self.V_robot_in_layers
+        )
+        if z_s is not None:
+            robot_node_f = robot_node_f + self.z_s_proj(z_s)[:, None, :]
+        or_edge_f = self._encoder_(
+            noisy_E_OR, self.E_or_dims, self.E_or_in_layers
+        )
+        rr_edge_f = self._encoder_(
+            noisy_E_RR, self.E_rr_dims, self.E_rr_in_layers
+        )
+
+        noisy_robot_node_f_list = [robot_node_f]
+        noisy_or_edge_f_list = [or_edge_f]
+        noisy_rr_edge_f_list = [rr_edge_f]
+
+        for layer in self.graph_layers:
+            robot_node_f, or_edge_f, rr_edge_f = layer(
+                object_node_f,
+                robot_node_f,
+                or_edge_f,
+                rr_edge_f,
+                t_embed,
+                patch_type=patch_type,
+            )
+            noisy_robot_node_f_list.append(robot_node_f)
+            noisy_or_edge_f_list.append(or_edge_f)
+            noisy_rr_edge_f_list.append(rr_edge_f)
+
+        update_robot_node_f = self.v_robot_wide_fc(
+            torch.cat(noisy_robot_node_f_list, dim=-1)
+        )
+
+        v_robot_pred = []
+        cur = 0
+        for layer_id, f_dim in enumerate(self.se3_out_dim):
+            v_robot_pred.append(
+                self.v_robot_output_module[layer_id](
+                    torch.cat(
+                        [update_robot_node_f, noisy_V_R[..., cur : cur + f_dim]],
+                        dim=-1,
+                    )
+                )
+            )
+            cur += f_dim
+        return torch.cat(v_robot_pred, dim=-1)
+ 

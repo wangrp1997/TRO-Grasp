@@ -1,12 +1,11 @@
 dataset:
   robot_names:
-    - 'allegro'
-
-  debug_object_names: null
-
-  batch_size: 100  # sample per object
-  num_workers: 8
-  object_pc_type: 'random'  # 'fixed', 'random', 'partial'
+    - 'boyahand'
+  debug_object_names:
+    - 'contactdb+apple'
+  batch_size: 4
+  num_workers: 0
+  object_pc_type: 'random'
 
 model:
   vqvae_cfg:
@@ -25,7 +24,7 @@ model:
     shadowhand: 17
     boyahand: 16
   inference_config:
-    inference_mode: 'unconditioned'  # unconditioned, palm_conditioned
+    inference_mode: 'unconditioned'
   bps_config:
     bps_type: 'random_uniform'
     n_bps_points: 124
@@ -54,17 +53,15 @@ model:
     e_out_hidden_dims: [256, 128]
     se3_out_dim: [3, 3]
   embodiment:
-    - 'allegro'
-    - 'barrett'
-    - 'shadowhand'
+    - 'boyahand'
   mode: "test"
   loss_config:
     trans_weight: 1.0
     rot_weight: 1.0
 
 test:
-  embodiment: "allegro"
-  ckpt: "ckpt/multi_hand.pth"
-  save_dir: "/mnt/hdd/tro_grasp/logs/paper_unconditioned_allegro_metrics"
+  embodiment: "boyahand"
+  ckpt: "/mnt/hdd/tro_grasp/logs/finetune_planeident/ckpt/10.pth"
+  save_dir: "/mnt/hdd/tro_grasp/logs/smoke_plane_boyahand_apple"
   gpu: 0
-  split_batch_size: 20
+  split_batch_size: 4

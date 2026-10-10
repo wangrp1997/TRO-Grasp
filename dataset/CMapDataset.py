@@ -23,7 +23,12 @@ class CMapDataset(Dataset):
         is_train: bool = True,
         debug_object_names: list = None,
         num_points: int = 512,
-        object_pc_type: str = 'random'
+        object_pc_type: str = 'random',
+        dataset_path: str = None,
+        extra_metadata_path: str = None,
+        clutter_dataset_path: str = None,
+        clutter_mix: float = 0.0,
+        depth_noise: float = 0.0,
     ):
         self.batch_size = batch_size
         self.robot_names = robot_names if robot_names is not None \
@@ -31,6 +36,17 @@ class CMapDataset(Dataset):
         self.is_train = is_train
         self.num_points = num_points
         self.object_pc_type = object_pc_type
+        self.clutter_mix = float(clutter_mix or 0.0)
+        self.depth_noise = float(depth_noise or 0.0)
+        self.clutter_samples = []
+        if clutter_dataset_path:
+            cpath = (
+                clutter_dataset_path
+                if os.path.isabs(clutter_dataset_path)
+                else os.path.join(ROOT_DIR, clutter_dataset_path)
+            )
+            blob = torch.load(cpath, map_location="cpu", weights_only=False)
+            self.clutter_samples = list(blob.get("samples", blob))
 
         self.hands = {}
         self.dofs = []
@@ -45,8 +61,21 @@ class CMapDataset(Dataset):
             print("!!! Using debug objects !!!")
             self.object_names = debug_object_names
 
-        dataset_path = os.path.join(ROOT_DIR, f'data/CMapDataset_filtered/cmap_dataset.pt')
-        metadata = torch.load(dataset_path)['metadata']
+        default_dataset_path = os.path.join(ROOT_DIR, f'data/CMapDataset_filtered/cmap_dataset.pt')
+        if dataset_path is not None:
+            resolved = dataset_path if os.path.isabs(dataset_path) else os.path.join(ROOT_DIR, dataset_path)
+        else:
+            resolved = default_dataset_path
+        metadata = list(torch.load(resolved, map_location='cpu')['metadata'])
+        if extra_metadata_path is not None:
+            extra_resolved = (
+                extra_metadata_path
+                if os.path.isabs(extra_metadata_path)
+                else os.path.join(ROOT_DIR, extra_metadata_path)
+            )
+            if extra_resolved != resolved:
+                extra_meta = torch.load(extra_resolved, map_location='cpu')['metadata']
+                metadata.extend(m for m in extra_meta if m[2] == 'boyahand')
         self.metadata = [m for m in metadata if m[1] in self.object_names and m[2] in self.robot_names]
         if not self.is_train:
             self.combination = []
@@ -83,6 +112,19 @@ class CMapDataset(Dataset):
             poses[link_id] = torch.from_numpy(pose)
         return poses
 
+    def _label_scene(self, scene_pc, object_name, thresh=0.02):
+        tgt = self.object_pcs[object_name]
+        # subsample target for speed
+        if tgt.shape[0] > 4096:
+            tgt = tgt[torch.randperm(tgt.shape[0])[:4096]]
+        d = torch.cdist(scene_pc, tgt).min(dim=1).values
+        return (d > thresh).long()  # 0 target, 1 clutter
+
+    def _maybe_noise(self, pc):
+        if self.depth_noise <= 0:
+            return pc
+        return pc + torch.randn_like(pc) * self.depth_noise
+
     def __getitem__(self, index):
         """
         Train: sample a batch of data
@@ -92,12 +134,15 @@ class CMapDataset(Dataset):
 
             robot_name_batch = []
             object_name_batch = []
+            view_dir_batch = []
             robot_pc_initial_batch = []
             robot_pc_target_batch = []
             robot_links_pc_batch = []
             robot_link_se3_batch = []
             object_pc_batch = []
             object_normal_batch = []
+            scene_pc_batch = []
+            scene_label_batch = []
             initial_q_batch = []
             target_q_batch = []
             all_link_se3_target_batch = []
@@ -107,12 +152,29 @@ class CMapDataset(Dataset):
 
             for idx in range(self.batch_size):
 
-                robot_name = random.choice(self.robot_names)
+                use_clutter = (
+                    self.clutter_mix > 0
+                    and self.clutter_samples
+                    and random.random() < self.clutter_mix
+                )
+                clutter_row = None
+                if use_clutter:
+                    clutter_row = random.choice(self.clutter_samples)
+                    robot_name = clutter_row["robot"]
+                    if robot_name not in self.robot_names:
+                        use_clutter = False
+                        clutter_row = None
+                        robot_name = random.choice(self.robot_names)
+                else:
+                    robot_name = random.choice(self.robot_names)
                 robot_name_batch.append(robot_name)
                 hand = self.hands[robot_name]
                 metadata_robot = [(m[0], m[1]) for m in self.metadata if m[2] == robot_name]
 
-                target_q, object_name = random.choice(metadata_robot)
+                if use_clutter:
+                    target_q, object_name = clutter_row["q"], clutter_row["object"]
+                else:
+                    target_q, object_name = random.choice(metadata_robot)
                 target_q_batch.append(target_q)
                 object_name_batch.append(object_name)
                 robot_links_pc_batch.append(hand.links_pc)
@@ -127,18 +189,43 @@ class CMapDataset(Dataset):
                     object_normal = self.object_normals[object_name][indices]
                     object_pc += torch.randn(object_pc.shape) * 0.002
                 else:  # 'partial', remove 50% points
-                    indices = torch.randperm(65536)[:self.num_points * 2]
-                    object_pc = self.object_pcs[object_name][indices]
+                    sel = torch.randperm(65536)[: self.num_points * 2]
+                    object_pc = self.object_pcs[object_name][sel]
+                    object_normal = self.object_normals[object_name][sel]
                     direction = torch.randn(3)
                     direction = direction / torch.norm(direction)
                     proj = object_pc @ direction
-                    _, indices = torch.sort(proj)
-                    indices = indices[self.num_points:]
-                    object_pc = object_pc[indices]
-                    object_normal = self.object_normals[object_name][indices]
+                    keep = torch.sort(proj).indices[self.num_points :]
+                    object_pc = object_pc[keep]
+                    object_normal = object_normal[keep]
+                    view_dir_batch.append(direction)
+                if self.object_pc_type != 'partial':
+                    view_dir_batch.append(torch.zeros(3, dtype=torch.float32))
 
+                if use_clutter:
+                    scene_pc = clutter_row["scene_pc"].float()
+                    if scene_pc.shape[0] != self.num_points:
+                        idx = torch.randint(0, scene_pc.shape[0], (self.num_points,))
+                        scene_pc = scene_pc[idx]
+                    scene_label = self._label_scene(scene_pc, object_name)
+                    tgt_idx = (scene_label == 0).nonzero(as_tuple=False).view(-1)
+                    if tgt_idx.numel() >= 32:
+                        pick = tgt_idx[torch.randint(0, tgt_idx.numel(), (self.num_points,))]
+                        object_pc = scene_pc[pick]
+                        object_normal = torch.zeros_like(object_pc)
+                    view_dir_batch[-1] = clutter_row.get(
+                        "view_dir", view_dir_batch[-1]
+                    ).float()
+                else:
+                    scene_pc = object_pc.clone()
+                    scene_label = torch.zeros(self.num_points, dtype=torch.long)
+
+                object_pc = self._maybe_noise(object_pc)
+                scene_pc = self._maybe_noise(scene_pc)
                 object_pc_batch.append(object_pc)
                 object_normal_batch.append(object_normal)
+                scene_pc_batch.append(scene_pc)
+                scene_label_batch.append(scene_label)
 
                 robot_pc_target, all_link_se3_target = hand.get_transformed_links_pc(target_q)
                 robot_pc_target_batch.append(robot_pc_target)
@@ -170,7 +257,10 @@ class CMapDataset(Dataset):
                 'initial_vec': all_link_vec_trans_initial_batch,
                 'target_vec': all_link_vec_trans_target_batch,
                 'initial_q': initial_q_batch,
-                'target_q': target_q_batch
+                'target_q': target_q_batch,
+                'view_dir': torch.stack(view_dir_batch),
+                'scene_pc': torch.stack(scene_pc_batch),
+                'scene_label': torch.stack(scene_label_batch),
             }
             
         else:  # validate
@@ -180,6 +270,12 @@ class CMapDataset(Dataset):
             object_pc_batch = torch.zeros([self.batch_size, self.num_points, 3], dtype=torch.float32)
             robot_links_pc_batch = []
             initial_se3_batch = []
+
+            view_dir_batch = []
+            scene_pc_batch = torch.zeros_like(object_pc_batch)
+            scene_label_batch = torch.zeros(
+                [self.batch_size, self.num_points], dtype=torch.long
+            )
 
             for batch_idx in range(self.batch_size):
                 initial_q = hand.get_initial_q()
@@ -196,13 +292,17 @@ class CMapDataset(Dataset):
                     _, indices = torch.sort(proj)
                     indices = indices[self.num_points:]
                     object_pc = object_pc[indices]
+                    view_dir_batch.append(direction)
                 else:
                     name = object_name.split('+')
                     object_path = os.path.join(ROOT_DIR, f'data/PointCloud/object/{name[0]}/{name[1]}.pt')
                     object_pc = torch.load(object_path)[:, :3]
+                    view_dir_batch.append(torch.zeros(3, dtype=torch.float32))
 
                 initial_q_batch[batch_idx] = initial_q
                 object_pc_batch[batch_idx] = object_pc
+                scene_pc_batch[batch_idx] = object_pc
+                scene_label_batch[batch_idx] = 0
 
             B, N, DOF = self.batch_size, self.num_points, len(hand.pk_chain.get_joint_parameter_names())
             assert initial_q_batch.shape == (B, DOF), \
@@ -216,7 +316,10 @@ class CMapDataset(Dataset):
                 'initial_q': initial_q_batch,
                 'initial_se3': torch.stack(initial_se3_batch, dim=0),
                 'object_pc': object_pc_batch,
-                'robot_links_pc': robot_links_pc_batch
+                'robot_links_pc': robot_links_pc_batch,
+                'view_dir': torch.stack(view_dir_batch),
+                'scene_pc': scene_pc_batch,
+                'scene_label': scene_label_batch,
             }
 
     def __len__(self):
@@ -236,7 +339,12 @@ def create_dataloader(cfg, is_train):
         robot_names=cfg.robot_names,
         is_train=is_train,
         debug_object_names=cfg.debug_object_names,
-        object_pc_type=cfg.object_pc_type
+        object_pc_type=cfg.object_pc_type,
+        dataset_path=getattr(cfg, 'dataset_path', None),
+        extra_metadata_path=getattr(cfg, 'extra_metadata_path', None),
+        clutter_dataset_path=getattr(cfg, 'clutter_dataset_path', None),
+        clutter_mix=getattr(cfg, 'clutter_mix', 0.0),
+        depth_noise=getattr(cfg, 'depth_noise', 0.0),
     )
     dataloader = DataLoader(
         dataset,

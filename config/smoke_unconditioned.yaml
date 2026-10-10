@@ -22,6 +22,7 @@ model:
     barrett: 10
     allegro: 21
     shadowhand: 17
+    boyahand: 16
   inference_config:
     inference_mode: 'unconditioned'
   bps_config:
@@ -63,6 +64,6 @@ model:
 test:
   embodiment: "shadowhand"
   ckpt: "ckpt/multi_hand.pth"
-  save_dir: "/mnt/hdd/tro_grasp/logs/smoke_shadowhand_apple"
+  save_dir: "/mnt/hdd/tro_grasp/logs/smoke_shadowhand_apple_metrics"
   gpu: 0
   split_batch_size: 4

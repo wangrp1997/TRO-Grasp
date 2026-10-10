@@ -1,12 +1,18 @@
 dataset:
   robot_names:
     - 'allegro'
-
+    - 'barrett'
+    - 'shadowhand'
+    - 'boyahand'
   debug_object_names: null
+  dataset_path: '/mnt/hdd/tro_grasp/data/cmap_dataset_with_boyahand.pt'
 
-  batch_size: 100  # sample per object
+  batch_size: 8
   num_workers: 8
-  object_pc_type: 'random'  # 'fixed', 'random', 'partial'
+  object_pc_type: 'partial'
+  # cmap_clutter_train.pt (800 HPR) is smoke-only, not the main train set.
+  clutter_dataset_path: '/mnt/hdd/tro_grasp/data/dgn2_cmap_clutter_merged.pt'
+  clutter_mix: 1.0
 
 model:
   vqvae_cfg:
@@ -24,8 +30,6 @@ model:
     allegro: 21
     shadowhand: 17
     boyahand: 16
-  inference_config:
-    inference_mode: 'unconditioned'  # unconditioned, palm_conditioned
   bps_config:
     bps_type: 'random_uniform'
     n_bps_points: 124
@@ -37,7 +41,7 @@ model:
     M: 1000
     beta_min: 0.0001
     beta_max: 0.02
-    ddim_steps: 20
+    ddim_steps: 100
     ddim_eta: 1.0
     lambda: 0.2
   denoiser_config:
@@ -53,18 +57,33 @@ model:
     v_out_hidden_dims: [256, 128]
     e_out_hidden_dims: [256, 128]
     se3_out_dim: [3, 3]
+  residual_config:
+    enabled: true
+    num_layers: 2
+    drop_prob: 0.2
+    z_s_dim: 64
+    zero_init_out: true
+  inference_config: False
   embodiment:
     - 'allegro'
     - 'barrett'
     - 'shadowhand'
-  mode: "test"
+    - 'boyahand'
+  mode: "train"
   loss_config:
     trans_weight: 1.0
     rot_weight: 1.0
+    ident_weight: 0.0
+    vis_weight: 0.0
 
-test:
-  embodiment: "allegro"
-  ckpt: "ckpt/multi_hand.pth"
-  save_dir: "/mnt/hdd/tro_grasp/logs/paper_unconditioned_allegro_metrics"
-  gpu: 0
-  split_batch_size: 20
+train:
+  lr: 1e-4
+  epochs: 80
+  lr_step: 20
+  lr_gamma: 0.8
+  save_interval: 10
+  save_freq: 10
+  save_dir: '/mnt/hdd/tro_grasp/logs/residual_clutter'
+  project_name: 'tro_residual_clutter'
+  resume_from: 'ckpt/partial.pth'
+  finetune: true

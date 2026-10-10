@@ -23,6 +23,7 @@ model:
     barrett: 10
     allegro: 21
     shadowhand: 17
+    boyahand: 16
   inference_config:
     inference_mode: 'palm_conditioned'  # unconditioned, palm_conditioned
     palm_names:

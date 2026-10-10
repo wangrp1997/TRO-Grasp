@@ -115,5 +115,7 @@ def validate_isaac(robot_name, object_name, q_batch, gpu: int = 0):
         cprint(f"Caught a ValueError: {e}", 'yellow')
         cprint(ret.stdout.strip(), 'blue')
         cprint(ret.stderr.strip(), 'red')
-        exit()
+        raise RuntimeError(
+            f"isaac_main failed (gpu={gpu}, code={ret.returncode}): {ret.stderr[-2000:]}"
+        ) from e
     return success, q_isaac

@@ -15,6 +15,7 @@ from utils.hand_model import create_hand_model
 from utils.pyroki_ik import PyrokiRetarget
 from utils.optimization import *
 from validation.validate_utils import validate_isaac
+from utils.extra_metrics import compute_grasp_metrics
 
 def prepare_input(batch, device):
 
@@ -49,6 +50,7 @@ def test(config):
 
     success_dict = {}
     diversity_dict = {}
+    extra_dict = {}
     vis_info = []
     batch_size = config.dataset.batch_size
     model.eval()
@@ -65,6 +67,7 @@ def test(config):
         initial_se3_list = []    # Conditioned
         object_pc_list = []
         transform_list = []
+        target_pos_acc = []
         while data_count != batch_size:
             split_num = min(batch_size - data_count, config.test.split_batch_size)
             initial_q = batch["initial_q"][data_count : data_count + split_num].to(device)
@@ -110,6 +113,7 @@ def test(config):
             initial_q_list.append(initial_q)
             initial_se3_list.append(initial_se3)
             predict_q_list.append(predict_q)
+            target_pos_acc.append(target_pos)
             object_pc_list.append(object_pc)
             for diffuse_step, pred_robot_pose in all_diffuse_step_poses_dict.items():
                 if diffuse_step not in transform_dict:
@@ -126,7 +130,13 @@ def test(config):
             gpu=config.test.gpu
         )
         success_dict[batch["object_name"]] = success
-
+        extra_dict[batch["object_name"]] = compute_grasp_metrics(
+            hand,
+            batch["object_name"],
+            all_predict_q,
+            torch.cat(target_pos_acc, dim=0),
+            target_links,
+        )
         # Diversity
         if torch.as_tensor(success).any():
             success_q = all_predict_q[success]
@@ -194,6 +204,14 @@ def test(config):
             line = "Grasp generation time: n/a (no timed grasps; first split is warmup).\n"
         print(line, end="")
         f.write(line)
+
+        if extra_dict:
+            keys = next(iter(extra_dict.values())).keys()
+            for k in keys:
+                vals = [m[k] for m in extra_dict.values()]
+                line = f"Total {k}: {sum(vals) / len(vals):.6g}\n"
+                print(line, end="")
+                f.write(line)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

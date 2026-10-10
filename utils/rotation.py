@@ -2,7 +2,12 @@ import torch
 from scipy.spatial.transform import Rotation
 from pytorch3d.transforms import matrix_to_axis_angle
 from pytorch3d.transforms import axis_angle_to_matrix
-from theseus.geometry.so3 import SO3
+
+# theseus pulls sksparse/cholmod; keep optional so Isaac env can import rotation.py
+def _so3():
+    from theseus.geometry.so3 import SO3
+
+    return SO3
 
 def matrix_to_euler(matrix):
     device = matrix.device
@@ -133,6 +138,7 @@ def compute_batch_relative_se3(T_1, T_2):
     return T_rel
 
 def se3_to_lie(se3: torch.Tensor) -> torch.Tensor:
+    SO3 = _so3()
     trans = se3[..., :3, 3]
     rot = se3[..., :3, :3]
     log_rot = SO3(tensor=rot.reshape(-1, 3, 3)).log_map()
@@ -140,6 +146,7 @@ def se3_to_lie(se3: torch.Tensor) -> torch.Tensor:
     return torch.cat([trans, log_rot], dim=-1)
 
 def lie_to_se3(lie: torch.Tensor) -> torch.Tensor:
+    SO3 = _so3()
     origin_shape = lie.shape[:-1]
     trans = lie[..., :3].reshape(-1, 3)
     log_rot = lie[..., 3:].reshape(-1, 3)

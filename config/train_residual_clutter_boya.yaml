@@ -1,0 +1,95 @@
+dataset:
+  robot_names:
+  - boyahand
+  debug_object_names: null
+  dataset_path: /mnt/hdd/tro_grasp/data/cmap_dataset_with_boyahand.pt
+  batch_size: 8
+  num_workers: 8
+  object_pc_type: partial
+  clutter_dataset_path: /mnt/hdd/tro_grasp/data/dgn2_cmap_clutter_merged.pt
+  clutter_mix: 1.0
+model:
+  vqvae_cfg:
+    n_embeddings: 1024
+    embedding_dim: 16
+    num_point: 25
+    num_dim: 64
+    local_decode_pts: 40
+    beta: 0.25
+  vqvae_pretrain: ckpt/vqvae.ckpt
+  object_patch: 25
+  max_link_node: 25
+  robot_links:
+    barrett: 10
+    allegro: 21
+    shadowhand: 17
+    boyahand: 16
+  bps_config:
+    bps_type: random_uniform
+    n_bps_points: 124
+    radius: 1.0
+    n_dims: 3
+  N_t_training: 10
+  diffusion_config:
+    scheduling: linear
+    M: 1000
+    beta_min: 0.0001
+    beta_max: 0.02
+    ddim_steps: 100
+    ddim_eta: 1.0
+    lambda: 0.2
+  denoiser_config:
+    t_embed_dim: 200
+    V_object_dims:
+    - 3
+    - 1
+    - 64
+    V_robot_dims:
+    - 3
+    - 3
+    - 64
+    E_or_dims:
+    - 3
+    - 3
+    E_rr_dims:
+    - 3
+    - 3
+    v_conv_dim: 384
+    e_conv_dim: 384
+    num_layers: 6
+    c_atten_head: 32
+    v_out_hidden_dims:
+    - 256
+    - 128
+    e_out_hidden_dims:
+    - 256
+    - 128
+    se3_out_dim:
+    - 3
+    - 3
+  residual_config:
+    enabled: true
+    num_layers: 2
+    drop_prob: 0.2
+    z_s_dim: 64
+    zero_init_out: true
+  inference_config: false
+  embodiment:
+  - boyahand
+  mode: train
+  loss_config:
+    trans_weight: 1.0
+    rot_weight: 1.0
+    ident_weight: 0.0
+    vis_weight: 0.0
+train:
+  lr: 0.0001
+  epochs: 80
+  lr_step: 20
+  lr_gamma: 0.8
+  save_interval: 10
+  save_freq: 10
+  save_dir: /mnt/hdd/tro_grasp/logs/residual_clutter_boya
+  project_name: tro_residual_clutter_boya
+  resume_from: /mnt/hdd/tro_grasp/logs/residual_clutter_boya/ckpt/latest.pth
+  finetune: true

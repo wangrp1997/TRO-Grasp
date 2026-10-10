@@ -1,6 +1,6 @@
 dataset:
   robot_names:
-    - 'allegro'
+    - 'boyahand'
 
   debug_object_names: null
 
@@ -57,14 +57,15 @@ model:
     - 'allegro'
     - 'barrett'
     - 'shadowhand'
+    - 'boyahand'
   mode: "test"
   loss_config:
     trans_weight: 1.0
     rot_weight: 1.0
 
 test:
-  embodiment: "allegro"
+  embodiment: "boyahand"
   ckpt: "ckpt/multi_hand.pth"
-  save_dir: "/mnt/hdd/tro_grasp/logs/paper_unconditioned_allegro_metrics"
+  save_dir: "/mnt/hdd/tro_grasp/logs/paper_unconditioned_boyahand"
   gpu: 0
   split_batch_size: 20

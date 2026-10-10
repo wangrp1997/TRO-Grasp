@@ -25,7 +25,12 @@ model:
     shadowhand: 17
     boyahand: 16
   inference_config:
-    inference_mode: 'unconditioned'  # unconditioned, palm_conditioned
+    inference_mode: 'unconditioned'
+    collision_guidance:
+      enabled: true
+      scale: 1.0
+      contact_margin: 0.008
+      knn: 32
   bps_config:
     bps_type: 'random_uniform'
     n_bps_points: 124
@@ -65,6 +70,6 @@ model:
 test:
   embodiment: "allegro"
   ckpt: "ckpt/multi_hand.pth"
-  save_dir: "/mnt/hdd/tro_grasp/logs/paper_unconditioned_allegro_metrics"
+  save_dir: "/mnt/hdd/tro_grasp/logs/paper_unconditioned_allegro_idguide_metrics"
   gpu: 0
   split_batch_size: 20

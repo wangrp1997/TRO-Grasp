@@ -24,6 +24,7 @@ model:
     barrett: 10
     allegro: 21
     shadowhand: 17
+    boyahand: 16
   bps_config:
     bps_type: 'random_uniform'
     n_bps_points: 124
@@ -60,6 +61,7 @@ model:
   loss_config:
     trans_weight: 1.0
     rot_weight: 1.0
+    ident_weight: 0.0
 
 train:
   lr: 1e-4

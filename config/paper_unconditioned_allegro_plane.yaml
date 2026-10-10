@@ -64,7 +64,7 @@ model:
 
 test:
   embodiment: "allegro"
-  ckpt: "ckpt/multi_hand.pth"
-  save_dir: "/mnt/hdd/tro_grasp/logs/paper_unconditioned_allegro_metrics"
+  ckpt: "/mnt/hdd/tro_grasp/logs/finetune_planeident/ckpt/10.pth"
+  save_dir: "/mnt/hdd/tro_grasp/logs/paper_unconditioned_allegro_plane"
   gpu: 0
   split_batch_size: 20

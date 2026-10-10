@@ -12,8 +12,13 @@ from theseus.geometry.so3 import SO3
 from bps_torch.bps import bps_torch
 from model.vqvae.vq_vae import VQVAE
 from utils.rotation import *
-from model.denoiser import GraphDenoiser
+from model.denoiser import GraphDenoiser, ResidualGraphDenoiser
 from utils.hand_model import create_hand_model
+from utils.kanatani_reliability import (
+    identifiability_collision_loss,
+    patch_plane_reliability,
+)
+from utils.link_occupancy import link_occupancy
 
 class RobotGraph(nn.Module):
 
@@ -32,6 +37,8 @@ class RobotGraph(nn.Module):
         embodiment,
         loss_config,
         mode="train",
+        residual_config=None,
+        occupancy_config=None,
     ):
 
         super(RobotGraph, self).__init__()
@@ -72,6 +79,42 @@ class RobotGraph(nn.Module):
             max_link_node=self.max_link_node,
             **OmegaConf.to_container(denoiser_config, resolve=True)
         )
+        rc = residual_config
+        if rc is not None and not isinstance(rc, dict):
+            rc = OmegaConf.to_container(rc, resolve=True)
+        rc = rc or {}
+        self.use_residual = bool(rc.get("enabled", False))
+        self.p_drop_clutter = float(rc.get("drop_prob", 0.2))
+        self.z_s_dim = int(rc.get("z_s_dim", 64))
+        self.residual_denoiser = None
+        if self.use_residual:
+            rcfg = OmegaConf.to_container(denoiser_config, resolve=True)
+            rcfg["num_layers"] = int(rc.get("num_layers", 2))
+            self.residual_denoiser = ResidualGraphDenoiser(
+                M=diffusion_config["M"],
+                object_patch=self.object_patch,
+                max_link_node=self.max_link_node,
+                z_s_dim=self.z_s_dim,
+                zero_init_out=bool(rc.get("zero_init_out", True)),
+                **rcfg,
+            )
+            self.scene_token_mlp = nn.Sequential(
+                nn.Linear(15, 64),
+                nn.SiLU(),
+                nn.Linear(64, self.z_s_dim),
+            )
+            self.obj_type_embed = nn.Embedding(2, 64)
+            self.freeze_eps_base()
+        oc = occupancy_config
+        if oc is not None and not isinstance(oc, dict):
+            oc = OmegaConf.to_container(oc, resolve=True)
+        oc = oc or {}
+        self.use_occupancy = bool(oc.get("enabled", False))
+        self.occ_radius = float(oc.get("radius", 0.015))
+        self.occ_weight = float(oc.get("weight", 1.0))
+        if self.use_occupancy:
+            # o^R sits in the same GraphDenoiser as SE3 (not a side MLP).
+            pass
         self.mode = mode
         self.link_embeddings = self.construct_bps()
         if self.mode == "train":
@@ -80,6 +123,11 @@ class RobotGraph(nn.Module):
             inference_config = OmegaConf.to_container(inference_config, resolve=True)
             self.inference_mode = inference_config["inference_mode"]
             assert self.inference_mode in ["unconditioned", "palm_conditioned"]
+            cg = inference_config.get("collision_guidance") or {}
+            self.collision_guidance = bool(cg.get("enabled", False))
+            self.cg_scale = float(cg.get("scale", 1.0))
+            self.cg_margin = float(cg.get("contact_margin", 0.008))
+            self.cg_knn = int(cg.get("knn", 32))
             if self.inference_mode == "palm_conditioned":
                 self.palm_names = inference_config["palm_names"]
                 self.interpolation_clip = inference_config["interpolation_clip"] * math.pi / 180
@@ -109,6 +157,24 @@ class RobotGraph(nn.Module):
                 embodiment_bps, dim=0
             )
         return link_embedding_dict
+
+    def _encode_object(self, object_pc, knn=32):
+        with torch.no_grad():
+            normal_pc, centroids, scale = self._normalize_pc_(object_pc)
+            object_tokens = self.vqvae.encode(normal_pc)
+            ident_w, ident_n = patch_plane_reliability(
+                normal_pc, object_tokens["xyz"], knn=knn
+            )
+        # Keep TRO's global scale channel. Do not replace it with ident.
+        object_nodes = torch.cat(
+            [
+                object_tokens["xyz"],
+                scale.expand(-1, self.object_patch, -1),
+                object_tokens["z_q"],
+            ],
+            dim=-1,
+        )
+        return object_nodes, normal_pc, object_tokens, ident_w, ident_n, scale, centroids
             
     def _unit_ball_(self, pc):
 
@@ -129,6 +195,162 @@ class RobotGraph(nn.Module):
         pc = pc / scale
 
         return pc, centroids, scale
+
+    def freeze_eps_base(self):
+        self.denoiser.eval()
+        for param in self.denoiser.parameters():
+            param.requires_grad = False
+        for param in self.vqvae.parameters():
+            param.requires_grad = False
+        for param in self.link_token_encoder.parameters():
+            param.requires_grad = False
+
+    def _pca_aw_mu(self, pc, eps=1e-8):
+        mu = pc.mean(dim=1)
+        x = pc - mu[:, None, :]
+        n = max(int(pc.shape[1]) - 1, 1)
+        cov = torch.matmul(x.transpose(1, 2), x) / n
+        evals, evecs = torch.linalg.eigh(cov)
+        w = evals.clamp_min(eps)
+        a = evecs.reshape(pc.shape[0], 9)
+        return a, w, mu
+
+    def _scene_token(self, tgt_pc):
+        a, w, mu = self._pca_aw_mu(tgt_pc)
+        return self.scene_token_mlp(torch.cat([a, w, mu], dim=-1))
+
+    def _resample_pc(self, pc, n, eps=1e-8):
+        B, N, C = pc.shape
+        if N == n:
+            return pc
+        if N == 0:
+            return pc.new_zeros(B, n, 3)
+        idx = torch.randint(0, N, (B, n), device=pc.device)
+        return torch.gather(pc, 1, idx.unsqueeze(-1).expand(-1, -1, C))
+
+    def _points_by_label(self, scene_pc, scene_label, label, n):
+        B = scene_pc.shape[0]
+        out = scene_pc.new_zeros(B, n, 3)
+        has = scene_pc.new_zeros(B, dtype=torch.bool)
+        for b in range(B):
+            pts = scene_pc[b][scene_label[b] == label]
+            if pts.shape[0] == 0:
+                continue
+            has[b] = True
+            out[b] = self._resample_pc(pts.unsqueeze(0), n)[0]
+        return out, has
+
+    def _encode_object_in_frame(self, pc, centroids, scale, knn=32):
+        pc_n = (pc - centroids) / scale.clamp_min(1e-8)
+        with torch.no_grad():
+            object_tokens = self.vqvae.encode(pc_n)
+            ident_w, ident_n = patch_plane_reliability(
+                pc_n, object_tokens["xyz"], knn=knn
+            )
+        object_nodes = torch.cat(
+            [
+                object_tokens["xyz"],
+                scale.expand(-1, self.object_patch, -1),
+                object_tokens["z_q"],
+            ],
+            dim=-1,
+        )
+        return object_nodes, pc_n, ident_w, ident_n
+
+    def _apply_type_embed(self, nodes, patch_type):
+        typed = nodes.clone()
+        valid = patch_type >= 0
+        safe = patch_type.clamp(min=0, max=1)
+        emb = self.obj_type_embed(safe) * valid.unsqueeze(-1).to(nodes.dtype)
+        typed[..., 4:] = typed[..., 4:] + emb
+        return typed
+
+    def _residual_object_graph(
+        self, batch, object_pc, object_nodes, scale, centroids, drop_flag, knn=32
+    ):
+        device = object_pc.device
+        B = object_pc.shape[0]
+        scene_pc = batch.get("scene_pc", object_pc)
+        scene_label = batch.get("scene_label")
+        if scene_label is None:
+            scene_label = torch.zeros(
+                scene_pc.shape[0],
+                scene_pc.shape[1],
+                device=device,
+                dtype=torch.long,
+            )
+        tgt_from_scene, has_tgt = self._points_by_label(
+            scene_pc, scene_label, 0, object_pc.shape[1]
+        )
+        clt_pc, has_clt = self._points_by_label(
+            scene_pc, scene_label, 1, object_pc.shape[1]
+        )
+        tgt_for_axis = torch.where(
+            has_tgt[:, None, None], tgt_from_scene, object_pc
+        )
+        tgt_n = (tgt_for_axis - centroids) / scale.clamp_min(1e-8)
+        z_s = self._scene_token(tgt_n)
+        z_s = torch.where(drop_flag[:, None], torch.zeros_like(z_s), z_s)
+
+        V_O_clt = object_nodes
+        if bool(has_clt.any()):
+            V_O_clt, _, _, _ = self._encode_object_in_frame(
+                clt_pc, centroids, scale, knn=knn
+            )
+        keep_clt = has_clt & (~drop_flag)
+        V_O_clt = V_O_clt * keep_clt[:, None, None].to(V_O_clt.dtype)
+        type_tgt = torch.zeros(B, self.object_patch, device=device, dtype=torch.long)
+        type_clt = torch.ones(B, self.object_patch, device=device, dtype=torch.long)
+        type_clt = torch.where(
+            keep_clt[:, None], type_clt, type_clt.new_full(type_clt.shape, -1)
+        )
+        if bool(keep_clt.any()):
+            V_O_full = torch.cat([object_nodes, V_O_clt], dim=1)
+            patch_type = torch.cat([type_tgt, type_clt], dim=1)
+        else:
+            V_O_full = object_nodes
+            patch_type = type_tgt
+        V_O_full = self._apply_type_embed(V_O_full, patch_type)
+        return V_O_full, z_s, patch_type
+
+    def _or_edges(self, noisy_V_R_se3, object_positions):
+        B, P, _ = object_positions.shape
+        dtype = object_positions.dtype
+        device = object_positions.device
+        object_se3 = (
+            torch.eye(4, device=device, dtype=dtype)
+            .expand(B, P, -1, -1)
+            .clone()
+        )
+        object_se3[:, :, :3, 3] = object_positions
+        return matrix_to_vector(
+            compute_batch_relative_se3(noisy_V_R_se3, object_se3)
+        )
+
+    def _eps_base(self, V_O, noisy_V_R, noisy_E_OR, noisy_E_RR, t):
+        with torch.no_grad():
+            eps = self.denoiser(V_O, noisy_V_R, noisy_E_OR, noisy_E_RR, t)
+        return eps.detach()
+
+    def _eps_res(
+        self,
+        V_O_full,
+        noisy_V_R,
+        noisy_E_OR_full,
+        noisy_E_RR,
+        t,
+        z_s,
+        patch_type,
+    ):
+        return self.residual_denoiser(
+            V_O_full,
+            noisy_V_R,
+            noisy_E_OR_full,
+            noisy_E_RR,
+            t,
+            z_s=z_s,
+            patch_type=patch_type,
+        )
 
     def init_diffusion(self, cfg):
 
@@ -191,16 +413,10 @@ class RobotGraph(nn.Module):
 
         ## Graph Construction
 
-        # Object Node
-        with torch.no_grad():
-            normal_pc, centroids, scale = self._normalize_pc_(object_pc)
-            object_tokens = self.vqvae.encode(normal_pc)
-            
-        object_nodes = torch.cat([
-            object_tokens["xyz"],
-            scale.expand(-1, self.object_patch, -1),
-            object_tokens["z_q"]
-        ], dim=-1)  # [B, P, 3+1+64]
+        ident_knn = int(self.loss_config.get("ident_knn", 32))
+        object_nodes, normal_pc, object_tokens, ident_w_node, ident_n_node, scale, centroids = self._encode_object(
+            object_pc, knn=ident_knn
+        )
 
         # Target Link Node
         target_vec = batch["target_vec"]
@@ -291,7 +507,19 @@ class RobotGraph(nn.Module):
         
         noisy_trans = a_bar.sqrt() * V_R_trans + (1 - a_bar).sqrt() * eta_V_R_trans
         noisy_rot = a_bar.sqrt() * V_R_rot + (1 - a_bar).sqrt() * eta_V_R_rot
-        noisy_V_R = torch.cat([noisy_trans, noisy_rot, V_R_embed], dim=-1)
+        embed64 = V_R_embed[..., :64]
+        eta_o = None
+        if self.use_occupancy and "scene_pc" in batch:
+            scene_pc = batch["scene_pc"]
+            scene_label = batch["scene_label"]
+            link_xyz = robot_nodes[:, :, :3] * scale + centroids
+            o_clean = link_occupancy(link_xyz, scene_pc, scene_label, self.occ_radius)
+            o_t = self._expand_and_reshape_(o_clean, "o")
+            eta_o = torch.randn_like(o_t)
+            noisy_o = a_bar.sqrt() * o_t + (1 - a_bar).sqrt() * eta_o
+            noisy_V_R = torch.cat([noisy_trans, noisy_rot, noisy_o, embed64], dim=-1)
+        else:
+            noisy_V_R = torch.cat([noisy_trans, noisy_rot, V_R_embed], dim=-1)
 
         # update graph edges
         noisy_V_R_se3 = vector_to_matrix(noisy_V_R[:, :, :6])           # [B*T, L, 4, 4] 
@@ -307,19 +535,55 @@ class RobotGraph(nn.Module):
         noisy_E_OR = compute_batch_relative_se3(noisy_V_R_se3, object_se3)
         noisy_E_OR = matrix_to_vector(noisy_E_OR)
 
-        ## Backward Denoising  
-        pred_link_noise = self.denoiser(
-            V_O,
-            noisy_V_R,
-            noisy_E_OR,
-            noisy_E_RR,
-            t
-        )
+        ## Backward Denoising
+        n_batch = object_pc.shape[0]
+        drop_t = None
+        eps_res = noisy_V_R.new_zeros(noisy_V_R.shape[0], noisy_V_R.shape[1], 6)
+        if self.use_residual:
+            ident_knn = int(self.loss_config.get("ident_knn", 32))
+            drop_flag = torch.rand(n_batch, device=device) < self.p_drop_clutter
+            if not self.training:
+                drop_flag = drop_flag.new_zeros(n_batch, dtype=torch.bool)
+            V_O_full, z_s, patch_type = self._residual_object_graph(
+                batch, object_pc, object_nodes, scale, centroids, drop_flag, knn=ident_knn
+            )
+            V_O_full = self._expand_and_reshape_(V_O_full, "V_O_full")
+            patch_type_t = (
+                patch_type[:, None, :]
+                .expand(-1, self.N_t_training, -1)
+                .reshape(n_batch * self.N_t_training, patch_type.shape[1])
+            )
+            z_s_t = z_s.repeat_interleave(self.N_t_training, dim=0)
+            drop_t = drop_flag.repeat_interleave(self.N_t_training, dim=0)
+            noisy_E_OR_full = self._or_edges(noisy_V_R_se3, V_O_full[:, :, :3])
+
+            eps_base = self._eps_base(V_O, noisy_V_R, noisy_E_OR, noisy_E_RR, t)
+            eps_res = self._eps_res(
+                V_O_full,
+                noisy_V_R,
+                noisy_E_OR_full,
+                noisy_E_RR,
+                t,
+                z_s_t,
+                patch_type_t,
+            )
+            pred_link_noise = eps_base + eps_res
+        else:
+            pred_link_noise = self.denoiser(
+                V_O,
+                noisy_V_R,
+                noisy_E_OR,
+                noisy_E_RR,
+                t
+            )
+            drop_t = None
+            eps_base = pred_link_noise
 
         # noise loss
         M_V_R = self._expand_and_reshape_(link_node_masks, "M_V_R").float()
         pred_trans_noise = pred_link_noise[:, :, :3]
-        pred_rot_noise = pred_link_noise[:, :, 3:]
+        pred_rot_noise = pred_link_noise[:, :, 3:6]
+        pred_eta_o = pred_link_noise[:, :, 6:9] if pred_link_noise.shape[-1] >= 9 else None
 
         error_trans_noise = (eta_V_R_trans - pred_trans_noise) ** 2
         error_trans_noise = error_trans_noise.mean(dim=-1)
@@ -329,14 +593,133 @@ class RobotGraph(nn.Module):
         error_rot_noise = error_rot_noise.mean(dim=-1)
         loss_rot_noise = (error_rot_noise * M_V_R).sum() / (M_V_R.sum() + eps)
 
-        total_loss = self.loss_config["trans_weight"] * loss_trans_noise + self.loss_config["rot_weight"] * loss_rot_noise
+        loss_res0 = loss_trans_noise.new_tensor(0.0)
+        eps_res_norm = loss_trans_noise.new_tensor(0.0)
+        if self.use_residual:
+            eps_res_norm = (eps_res.pow(2).mean(dim=-1) * M_V_R).sum() / (
+                M_V_R.sum() + eps
+            )
+            if drop_t is not None and bool(drop_t.any()):
+                w_drop = M_V_R * drop_t[:, None].to(M_V_R.dtype)
+                loss_res0 = (eps_res.pow(2).mean(dim=-1) * w_drop).sum() / (
+                    w_drop.sum() + eps
+                )
+
+        loss_occ = loss_trans_noise.new_tensor(0.0)
+        if pred_eta_o is not None and eta_o is not None:
+            error_o = (eta_o - pred_eta_o) ** 2
+            loss_occ = (error_o.mean(dim=-1) * M_V_R).sum() / (M_V_R.sum() + eps)
+
+        ident_weight = float(self.loss_config.get("ident_weight", 0.0))
+        loss_ident = loss_trans_noise.new_tensor(0.0)
+        if ident_weight > 0:
+            patch_xyz = V_O[:, :, :3]
+            ident_knn = int(self.loss_config.get("ident_knn", 32))
+            contact_margin = float(self.loss_config.get("ident_contact_margin", 0.008))
+            ident_t_max = int(self.loss_config.get("ident_t_max", 200))
+            t_dev = torch.as_tensor(t, device=device)
+            low_t = t_dev < ident_t_max
+            if low_t.any():
+                ident_w = ident_w_node.repeat_interleave(self.N_t_training, dim=0)
+                ident_n = ident_n_node.repeat_interleave(self.N_t_training, dim=0)
+
+                pred_x0_trans = (
+                    noisy_trans - (1 - a_bar).sqrt() * pred_trans_noise
+                ) / a_bar.sqrt().clamp_min(eps)
+
+                ident_acc = loss_trans_noise.new_tensor(0.0)
+                n_used = 0
+                for b in torch.where(low_t)[0].tolist():
+                    orig_b = b // self.N_t_training
+                    robot_name = batch["robot_name"][orig_b]
+                    n_link = self.robot_links[robot_name]
+                    ident_acc = ident_acc + identifiability_collision_loss(
+                        pred_x0_trans[b : b + 1, :n_link],
+                        patch_xyz[b : b + 1],
+                        ident_w[b : b + 1],
+                        ident_n[b : b + 1],
+                        contact_margin=contact_margin,
+                    )
+                    n_used += 1
+                loss_ident = ident_acc / max(n_used, 1)
+
+        vis_weight = float(self.loss_config.get("vis_weight", 0.0))
+        loss_vis = loss_trans_noise.new_tensor(0.0)
+        view_dir = batch.get("view_dir")
+        if vis_weight > 0 and view_dir is not None:
+            vd = view_dir
+            if vd.dim() == 2 and vd.abs().sum() > 0:
+                pred_x0_trans = (
+                    noisy_trans - (1 - a_bar).sqrt() * pred_trans_noise
+                ) / a_bar.sqrt().clamp_min(eps)
+                vd_t = vd.repeat_interleave(self.N_t_training, dim=0)
+                vis_acc = loss_trans_noise.new_tensor(0.0)
+                n_used = 0
+                for b in range(pred_x0_trans.shape[0]):
+                    orig_b = b // self.N_t_training
+                    if vd[orig_b].abs().sum() < 1e-8:
+                        continue
+                    robot_name = batch["robot_name"][orig_b]
+                    n_link = self.robot_links[robot_name]
+                    center = pred_x0_trans.new_zeros(1, 3)
+                    vis_acc = vis_acc + visibility_approach_loss(
+                        pred_x0_trans[b : b + 1, :n_link],
+                        vd_t[b : b + 1],
+                        center,
+                    )
+                    n_used += 1
+                if n_used:
+                    loss_vis = vis_acc / n_used
+
+        occ_w = float(getattr(self, "occ_weight", 0.0)) if getattr(self, "use_occupancy", False) else 0.0
+        total_loss = (
+            self.loss_config["trans_weight"] * loss_trans_noise
+            + self.loss_config["rot_weight"] * loss_rot_noise
+            + ident_weight * loss_ident
+            + vis_weight * loss_vis
+            + loss_res0
+            + occ_w * loss_occ
+        )
         loss_dict = {
             "loss_rot": loss_rot_noise,
             "loss_trans": loss_trans_noise,
-            "loss_total": total_loss
+            "loss_ident": loss_ident,
+            "loss_vis": loss_vis,
+            "loss_res0": loss_res0,
+            "loss_occ": loss_occ,
+            "eps_res_norm": eps_res_norm,
+            "loss_total": total_loss,
         }
         return loss_dict
 
+
+    def _predict_noise_infer(
+        self,
+        batch,
+        object_pc,
+        object_nodes,
+        scale,
+        centroids,
+        noisy_V_R,
+        noisy_E_OR,
+        noisy_E_RR,
+        t,
+    ):
+        eps = self.denoiser(
+            object_nodes, noisy_V_R, noisy_E_OR, noisy_E_RR, t
+        )
+        if not self.use_residual:
+            return eps
+        drop_flag = object_pc.new_zeros(object_pc.shape[0], dtype=torch.bool)
+        knn = int(getattr(self, "cg_knn", 32))
+        V_O_full, z_s, patch_type = self._residual_object_graph(
+            batch, object_pc, object_nodes, scale, centroids, drop_flag, knn=knn
+        )
+        noisy_V_R_se3 = vector_to_matrix(noisy_V_R[:, :, :6])
+        noisy_E_OR_full = self._or_edges(noisy_V_R_se3, V_O_full[:, :, :3])
+        return eps + self._eps_res(
+            V_O_full, noisy_V_R, noisy_E_OR_full, noisy_E_RR, t, z_s, patch_type
+        )
 
     def get_start_timestamp(self, mu=1.596, eps=1e-8):
     
@@ -377,17 +760,12 @@ class RobotGraph(nn.Module):
         link_names = list(batch["robot_links_pc"][0].keys())
         valid_links = self.robot_links[robot_name]
 
-        # Object Node
-        with torch.no_grad():
-            normal_pc, centroids, scale = self._normalize_pc_(object_pc)
-            object_tokens = self.vqvae.encode(normal_pc)
-            
-        object_nodes = torch.cat([
-            object_tokens["xyz"],
-            scale.expand(-1, self.object_patch, -1),
-            object_tokens["z_q"]
-        ], dim=-1)  # [B, P, 3+1+64]
-
+        # Object Node: xyz + Kanatani plane-ident + VQ code
+        object_nodes, normal_pc, object_tokens, ident_w, ident_n, scale, centroids = self._encode_object(
+            object_pc, knn=getattr(self, "cg_knn", 32)
+        )
+        ident_w = ident_w.detach()
+        ident_n = ident_n.detach()
       
         if self.inference_mode == "unconditioned":
 
@@ -433,8 +811,12 @@ class RobotGraph(nn.Module):
                 
                 diffuse_step = diffuse_step.item()
                 # predict noise
-                pred_link_pose_noise = self.denoiser(
+                pred_link_pose_noise = self._predict_noise_infer(
+                    batch,
+                    object_pc,
                     object_nodes,
+                    scale,
+                    centroids,
                     noisy_V_R,
                     noisy_E_OR,
                     noisy_E_RR,
@@ -459,6 +841,24 @@ class RobotGraph(nn.Module):
                 x_t_rot = noisy_V_R_rot
                 x_0_trans = (x_t_trans - (1 - a_bar_t).sqrt() * pred_link_trans_noise) / a_bar_t.sqrt()
                 x_0_rot = (x_t_rot - (1 - a_bar_t).sqrt() * pred_link_rot_noise) / a_bar_t.sqrt()
+
+                if getattr(self, "collision_guidance", False):
+                    n_link = self.robot_links[robot_name]
+                    with torch.enable_grad():
+                        x_guided = x_0_trans.detach().requires_grad_(True)
+                        guide_loss = identifiability_collision_loss(
+                            x_guided[:, :n_link],
+                            object_nodes[:, :, :3],
+                            ident_w,
+                            ident_n,
+                            contact_margin=self.cg_margin,
+                        )
+                        grad = torch.autograd.grad(guide_loss, x_guided)[0]
+                    step = self.cg_scale * (1.0 - a_bar_t).clamp_min(0.05)
+                    x_0_trans = x_0_trans - step * grad.detach()
+                    pred_link_trans_noise = (
+                        x_t_trans - a_bar_t.sqrt() * x_0_trans
+                    ) / (1 - a_bar_t).sqrt().clamp_min(1e-8)
 
                 sigma_t = self.eta * torch.sqrt(((1 - a_bar_prev) / (1 - a_bar_t)) * (1 - a_bar_t / a_bar_prev))            
                 ddim_coeffient = torch.sqrt(1 - a_bar_prev - sigma_t ** 2)
@@ -555,8 +955,12 @@ class RobotGraph(nn.Module):
                 
                 diffuse_step = int(ddim_t[i].item())
                 # predict noise
-                pred_link_pose_noise = self.denoiser(
+                pred_link_pose_noise = self._predict_noise_infer(
+                    batch,
+                    object_pc,
                     object_nodes,
+                    scale,
+                    centroids,
                     noisy_V_R,
                     noisy_E_OR,
                     noisy_E_RR,
